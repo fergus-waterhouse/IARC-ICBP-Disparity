@@ -6,6 +6,7 @@
 
 suppressPackageStartupMessages({
     library(tidyverse)
+    library(ggplot2)
     library(glue)
     library(broom)
 })
@@ -281,3 +282,205 @@ write.csv(
 
 
 # == STEP 6: AVOIDABLE DEATHS (SES & AGE) ==============================
+# 1. Age-Associated Avoidable Deaths
+
+age_ref <- df %>%
+    filter(ses == 0 & agr == 1) %>%
+    select(registry, cancer, R_ref = netsurv)
+
+age_target <- df %>%
+    filter(ses == 0 & agr == 2) %>%
+    select(registry, cancer, 
+           N_x = cases_in_period, 
+           R_x = netsurv, 
+           S_x_star = exp_surv)
+
+age_ad <- age_target %>%
+    inner_join(age_ref, by = c("registry", "cancer")) %>%
+    mutate(
+        age_avoidable_deaths = pmax(0, N_x * (R_ref - R_x) * S_x_star)
+    ) %>%
+    select(registry, cancer, age_avoidable_deaths)
+
+
+# 2. SES-Associated Avoidable Deaths
+# Get reference group (Least deprived: ses = 1)
+ses_ref <- df %>%
+    filter(agr == 0 & ses == 1) %>%
+    select(registry, cancer, R_ref = netsurv)
+
+# Get target groups (Other SES groups: ses = 2, 3, 4, 5)
+ses_target <- df %>%
+    filter(agr == 0 & ses %in% c(2, 3, 4, 5)) %>%
+    select(registry, cancer, ses, 
+           N_x = cases_in_period, 
+           R_x = netsurv, 
+           S_x_star = exp_surv)
+
+# Calculate SES-associated Avoidable Deaths for each group, cap at 0, then sum
+ses_ad <- ses_target %>%
+    inner_join(ses_ref, by = c("registry", "cancer")) %>%
+    mutate(
+        ad_per_group = pmax(0, N_x * (R_ref - R_x) * S_x_star)
+    ) %>%
+    group_by(registry, cancer) %>%
+    summarise(
+        ses_avoidable_deaths = sum(ad_per_group),
+        .groups = "drop"
+    )
+
+
+# 3. Excess Deaths
+excess_df <- df %>%
+    filter(agr == 0 & ses == 0) %>%
+    select(registry, cancer, 
+           N_total = cases_in_period, 
+           os_km, 
+           exp_surv) %>%
+    mutate(
+        # Cap at 0 in the rare event that observed survival > expected survival
+        excess_deaths = pmax(0, N_total * (exp_surv - os_km))
+    ) %>%
+    select(registry, cancer, excess_deaths)
+
+
+# 4. Combine Results & Calculate Proportions
+total_summary <- age_ad %>%
+    full_join(ses_ad, by = c("registry", "cancer")) %>%
+    full_join(excess_df, by = c("registry", "cancer")) %>%
+    mutate(
+        # Calculate proportions
+        # Using if_else ensures that if excess_deaths == 0, we don't get an Inf/NaN error
+        prop_age_avoidable = if_else(excess_deaths > 0, age_avoidable_deaths / excess_deaths, 0),
+        prop_ses_avoidable = if_else(excess_deaths > 0, ses_avoidable_deaths / excess_deaths, 0)
+    )
+
+print("Final Summary Dataset:")
+print(total_summary)
+
+# PLOT
+
+# 1. Define the requested color palette
+registry_cols <- rev(c(
+    "England"      = "#E64B35",
+    "Scotland"     = "#00468B",
+    "N Ireland"    = "chartreuse4",
+    "Wales"        = "#AD002A", 
+    "Ireland"      = "#00A087",
+    "Victoria"     = "#FEB24C",
+    "Queensland"   = "sienna2", 
+    "New Zealand"  = "#925E9F" 
+))
+
+cancer_order <- rev(c(
+    "Breast (C50)", "Rectum (C19-20)", "Colon (C18)", 
+    "Ovary (...)", "Lung (C33-34)", "Oesophagus (C15)", 
+    "Stomach (C16)", "Liver (C22)", "Pancreas (C25)"
+))
+
+# 2. Define the new plotting function
+create_avoidable_lollipop <- function(data, col_prop, col_abs, out_file, 
+                                      shape_solid = 16, size_solid = 3.25) {
+    
+    # 1. NEW: Lock the registry factor levels to the exact order of your color palette
+    data$registry <- factor(data$registry, levels = names(registry_cols))
+    data$cancer <- factor(data$cancer, levels = cancer_order)
+    if(!is.factor(data$cancer)) data$cancer <- as.factor(data$cancer)
+    
+    n_reg <- nlevels(data$registry)
+    dodge_width <- 0.75
+    
+    # Pre-calculate dodging on the X-axis
+    plot_data <- data %>%
+        mutate(
+            cancer_num = as.numeric(cancer),
+            registry_num = as.numeric(registry),
+            dodge_offset = (registry_num - (n_reg + 1) / 2) * (dodge_width / n_reg),
+            x_dodged = cancer_num + dodge_offset
+        )
+    
+    cancer_labels <- levels(plot_data$cancer)
+    
+    p <- ggplot(plot_data, aes(color = registry)) +
+        # Background Zebra striping 
+        geom_rect(
+            data = data.frame(cancer_num = 1:length(cancer_labels)),
+            aes(xmin = cancer_num - 0.4, xmax = cancer_num + 0.4, ymin = -Inf, ymax = Inf),
+            fill = "grey90", alpha = 0.3, color = NA, inherit.aes = FALSE 
+        ) +
+        # Segment from 0 to the avoidable deaths proportion
+        geom_segment(
+            aes(
+                x = x_dodged,
+                xend = x_dodged,
+                y = 0,
+                yend = .data[[col_prop]]
+            ),
+            linewidth = 0.8, alpha = 0.6
+        ) +
+        # Solid Shape at the proportion value
+        geom_point(
+            aes(x = x_dodged, y = .data[[col_prop]]), 
+            size = size_solid, shape = shape_solid
+        ) +
+        # Text representing absolute avoidable deaths
+        geom_text(
+            aes(
+                x = x_dodged, 
+                y = .data[[col_prop]], 
+                label = scales::comma(round(.data[[col_abs]]))
+            ),
+            hjust = 0,  
+            nudge_y = 0.005,
+            size = 3.5,
+            show.legend = FALSE
+        ) +
+        scale_y_continuous(
+            labels = scales::percent_format(accuracy = 1),
+            expand = expansion(mult = c(0, 0.15)) 
+        ) +
+        scale_x_continuous(breaks = 1:length(cancer_labels), labels = cancer_labels) +
+        
+        # 2. NEW: Force the legend to order starting from "England" to "New Zealand"
+        scale_color_manual(
+            values = registry_cols, 
+            breaks = rev(names(registry_cols))
+        ) +
+        
+        labs(y = "Proporiton of Excess Deaths Avoidable", x = NULL, color = "Registry") +
+        theme_minimal() +
+        theme(
+            panel.grid.major.y = element_blank(), 
+            panel.grid.minor.y = element_blank(),
+            axis.line.y = element_line(linewidth = 0.75, color = "grey30"),
+            axis.ticks.y = element_line(linewidth = 0.75, color = "grey30"),
+            axis.text.y = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 8), 
+            text = element_text(size = 12),
+            legend.position = "bottom",           
+            legend.direction = "horizontal",      
+            legend.box.margin = margin(t = 10),   
+            legend.title = element_blank()        
+        ) + 
+        coord_flip()
+    
+    ggsave(out_file, p, units = "px", width = 2660, height = 3800)
+    return(p)
+}
+
+# 3. Create the two separate plots
+
+# 1. Age-Associated Avoidable Deaths Plot
+plot_age <- create_avoidable_lollipop(
+    data      = total_summary,
+    col_prop  = "prop_age_avoidable",
+    col_abs   = "age_avoidable_deaths",
+    out_file  = "age_avoidable_deaths_plot.png"
+)
+
+# 2. SES-Associated Avoidable Deaths Plot
+plot_ses <- create_avoidable_lollipop(
+    data      = total_summary,
+    col_prop  = "prop_ses_avoidable",
+    col_abs   = "ses_avoidable_deaths",
+    out_file  = "ses_avoidable_deaths_plot.png"
+)
